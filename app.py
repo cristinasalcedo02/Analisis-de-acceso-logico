@@ -7,80 +7,55 @@ from collections import Counter
 import streamlit as st
 import pandas as pd
 
-# Intenta cargar matplotlib; si falta, avisa claramente
+# --- Dependencias que deben estar en requirements.txt ---
 try:
     import matplotlib.pyplot as plt
 except ModuleNotFoundError:
-    st.error("Falta 'matplotlib'. Asegúrate de que 'requirements.txt' incluya: matplotlib")
+    st.error("Falta 'matplotlib'. Asegúrate de que requirements.txt incluya: matplotlib")
     st.stop()
 
-# PDF
 try:
     from fpdf import FPDF
 except ModuleNotFoundError:
-    st.error("Falta 'fpdf'. Asegúrate de que 'requirements.txt' incluya: fpdf")
+    st.error("Falta 'fpdf'. Asegúrate de que requirements.txt incluya: fpdf")
     st.stop()
 
-# ---------------------------
-# Configuración general
-# ---------------------------
-st.set_page_config(page_title="Auditoría de Acceso Lógico", layout="wide")
-
+# ========== Configuración ==========
+st.set_page_config(page_title="Auditoría de Acceso Lógico", page_icon="🔐", layout="wide")
 st.title("🔐 Auditoría de Acceso Lógico en Linux – ISO/IEC 27001")
-st.markdown(
-    "Esta aplicación analiza **usuarios del sistema**, detecta **UIDs duplicados**, "
-    "lee **intentos fallidos de acceso SSH** y evalúa el estado de **MFA**. "
-    "Puedes subir archivos reales o usar datos de ejemplo y **exportar un PDF** con el informe."
+st.write(
+    "Sube los **archivos reales** del sistema para ejecutar el análisis:\n"
+    "- `/etc/passwd`\n"
+    "- Logs SSH (por ejemplo `auth.log` o salida de `journalctl`)\n"
+    "- `/etc/ssh/sshd_config`\n\n"
+    "La app detectará **UIDs duplicados**, intentos fallidos de acceso y el estado de **MFA**, "
+    "mostrará **gráficos** y permitirá **exportar un informe PDF**."
 )
 
-# ---------------------------
-# Datos de ejemplo
-# ---------------------------
-EXAMPLE_PASSWD = """root:x:0:0:root:/root:/bin/bash
-carlos:x:1000:1000::/home/carlos:/bin/bash
-paola:x:1001:1001::/home/paola:/bin/bash
-juan:x:1002:1002::/home/juan:/bin/bash
-pedro:x:1003:1003::/home/pedro:/bin/bash
-maria:x:1003:1004::/home/maria:/bin/bash
-nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
-"""
-
-EXAMPLE_LOGS = """Aug  7 10:15:01 server sshd[1234]: Failed password for invalid user guest from 192.168.1.10 port 2222 ssh2
-Aug  7 10:20:22 server sshd[1235]: Failed password for admin from 192.168.1.11 port 2223 ssh2
-Aug  7 11:12:44 server sshd[1236]: Failed password for juan from 192.168.1.20 port 2224 ssh2
-"""
-
-EXAMPLE_SSHD = """# sshd_config ejemplo
-Port 22
-PasswordAuthentication yes
-ChallengeResponseAuthentication yes
-UsePAM yes
-# Falta AuthenticationMethods → MFA parcial
-"""
-
-# ---------------------------
-# Sidebar: entradas
-# ---------------------------
 with st.sidebar:
-    st.header("⚙️ Entradas")
-    use_examples = st.toggle("Usar datos de ejemplo", value=True)
-    passwd_file = st.file_uploader("`/etc/passwd`", type=["txt", "conf", "passwd"])
-    logs_file = st.file_uploader("Logs SSH (journalctl/auth.log)", type=["log", "txt"])
-    sshd_file = st.file_uploader("`/etc/ssh/sshd_config`", type=["conf", "txt"])
+    st.header("📂 Cargar archivos")
+    passwd_file = st.file_uploader("Archivo `/etc/passwd`", type=["txt", "conf", "passwd"])
+    logs_file   = st.file_uploader("Logs SSH (auth.log/journalctl)", type=["log", "txt"])
+    sshd_file   = st.file_uploader("Archivo `/etc/ssh/sshd_config`", type=["conf", "txt"])
 
-def get_text(uploaded_file, example_text):
-    if use_examples or not uploaded_file:
-        return example_text
-    return uploaded_file.read().decode("utf-8", errors="ignore")
+# Si faltan archivos, no mostramos nada más
+if not (passwd_file and logs_file and sshd_file):
+    st.warning("⚠️ Sube **los tres archivos** para iniciar el análisis.")
+    st.stop()
 
-passwd_text = get_text(passwd_file, EXAMPLE_PASSWD)
-logs_text   = get_text(logs_file,   EXAMPLE_LOGS)
-sshd_text   = get_text(sshd_file,   EXAMPLE_SSHD)
+# ========== Lectura segura de archivos ==========
+def read_text(uploaded) -> str:
+    return uploaded.read().decode("utf-8", errors="ignore")
 
-# ---------------------------
-# Parsers
-# ---------------------------
+passwd_text = read_text(passwd_file)
+logs_text   = read_text(logs_file)
+sshd_text   = read_text(sshd_file)
+
+# ========== Parsers ==========
 def parse_passwd(text: str) -> pd.DataFrame:
+    """
+    /etc/passwd -> DataFrame con columnas: user, uid, home, shell
+    """
     rows = []
     for line in text.splitlines():
         if not line.strip() or line.startswith("#"):
@@ -95,12 +70,12 @@ def parse_passwd(text: str) -> pd.DataFrame:
             rows.append({"user": user, "uid": uid, "home": home, "shell": shell})
     return pd.DataFrame(rows)
 
+# Ej: "Aug  7 10:15:01 server sshd[1234]: Failed password for admin from 192.168.1.11 port 2223 ssh2"
 LOG_PAT = re.compile(
     r"(?P<mon>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2}).*sshd.*Failed password.*for\s+(?:invalid user\s+)?(?P<user>[A-Za-z0-9._-]+)\s+from\s+(?P<ip>\d+\.\d+\.\d+\.\d+)",
     re.IGNORECASE,
 )
 MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
-
 def month_to_num(m): 
     return MONTHS.index(m)+1 if m in MONTHS else 1
 
@@ -118,17 +93,31 @@ def parse_failed_logins(text: str) -> pd.DataFrame:
                 )
             except Exception:
                 dt = None
-            rows.append({
-                "datetime": dt, "user": d["user"], "ip": d["ip"], "raw": line.strip()
-            })
+            rows.append({"datetime": dt, "user": d["user"], "ip": d["ip"], "raw": line.strip()})
     return pd.DataFrame(rows)
 
 def parse_sshd_config(text: str) -> dict:
+    """
+    Determina MFA:
+      - full     -> AuthenticationMethods presente y combinando factores (ej: publickey,password)
+      - partial  -> ChallengeResponseAuthentication yes y UsePAM yes, pero sin AuthenticationMethods
+      - no       -> Nada de lo anterior
+    """
     lines = [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
-    d = {l.split()[0].lower(): l for l in lines if l.split()}
-    has_auth_methods = any(k == "authenticationmethods" and ("," in v.lower() or "publickey" in v.lower()) for k, v in d.items())
-    challenge_yes    = "challengeresponseauthentication" in d and "yes" in d["challengeresponseauthentication"].lower()
-    usepam_yes       = "usepam" in d and "yes" in d["usepam"].lower()
+    # Diccionario normalizado por clave (lower)
+    entries = {}
+    for l in lines:
+        toks = l.split()
+        if not toks: 
+            continue
+        entries[toks[0].lower()] = l
+
+    has_auth_methods = any(
+        k == "authenticationmethods" and ("," in v.lower() or "publickey" in v.lower())
+        for k, v in entries.items()
+    )
+    challenge_yes = "challengeresponseauthentication" in entries and "yes" in entries["challengeresponseauthentication"].lower()
+    usepam_yes    = "usepam" in entries and "yes" in entries["usepam"].lower()
 
     if has_auth_methods:
         status = "full"
@@ -138,13 +127,12 @@ def parse_sshd_config(text: str) -> dict:
         status = "no"
     return {"status": status, "lines": lines}
 
-# ---------------------------
-# Procesamiento
-# ---------------------------
+# ========== Procesamiento ==========
 users_df = parse_passwd(passwd_text)
 fails_df = parse_failed_logins(logs_text)
 sshd_info = parse_sshd_config(sshd_text)
 
+# UIDs duplicados
 dup_map = {}
 if not users_df.empty:
     counts = Counter(users_df["uid"])
@@ -152,40 +140,40 @@ if not users_df.empty:
         if c and c > 1:
             dup_map[uid] = list(users_df.loc[users_df["uid"] == uid, "user"].values)
 
+# MFA
 mfa_status = sshd_info["status"]
 mfa_label = {
-    "full":    "MFA correctamente configurado (AuthenticationMethods).",
+    "full":    "MFA correctamente configurado (AuthenticationMethods presente).",
     "partial": "MFA parcialmente configurado (ChallengeResponseAuthentication/UsePAM sin AuthenticationMethods).",
-    "no":      "MFA NO configurado."
+    "no":      "MFA NO configurado.",
 }[mfa_status]
 
-# Riesgo simple
+# Riesgo simple (puedes ajustar ponderaciones)
 risk_score = 0
 risk_score += 2 if len(dup_map) > 0 else 0
 risk_score += 2 if len(fails_df) >= 5 else (1 if len(fails_df) > 0 else 0)
 risk_score += 0 if mfa_status == "full" else (1 if mfa_status == "partial" else 3)
 risk_level = "ALTO" if risk_score >= 5 else ("MEDIO" if risk_score >= 3 else "BAJO")
 
-# ---------------------------
-# Salida visual
-# ---------------------------
-st.markdown("## 👥 Usuarios del sistema")
+# ========== Salida ==========
+st.subheader("👥 Usuarios del sistema")
 st.dataframe(users_df, use_container_width=True)
 
-st.markdown("## 🔁 UIDs duplicados (cuentas compartidas)")
+st.subheader("🔁 UIDs duplicados (cuentas compartidas)")
 if dup_map:
     for uid, names in dup_map.items():
         st.error(f"UID **{uid}** compartido por: **{', '.join(names)}**")
 else:
     st.success("No se detectaron cuentas con UID compartido.")
 
-st.markdown("## 🚨 Intentos fallidos de acceso SSH")
+st.subheader("🚨 Intentos fallidos de acceso SSH")
 if fails_df.empty:
     st.info("No se detectaron intentos fallidos en los logs.")
 else:
     st.dataframe(fails_df[["datetime", "user", "ip", "raw"]], use_container_width=True)
 
-    # Gráfico por fecha (si hay timestamps)
+    # Gráfico por día si hay timestamps
+    fig = None
     if fails_df["datetime"].notna().any():
         df_plot = fails_df.dropna(subset=["datetime"]).copy()
         df_plot["date"] = df_plot["datetime"].dt.date
@@ -196,10 +184,8 @@ else:
         ax.set_xlabel("Fecha")
         ax.set_ylabel("Intentos")
         st.pyplot(fig)
-    else:
-        fig = None
 
-st.markdown("## 🔐 Estado del MFA")
+st.subheader("🔑 Estado del MFA")
 if mfa_status == "full":
     st.success(mfa_label)
 elif mfa_status == "partial":
@@ -207,23 +193,19 @@ elif mfa_status == "partial":
 else:
     st.error(mfa_label)
 
-st.markdown("## 🧮 Evaluación de Riesgo")
-col1, col2 = st.columns(2)
-with col1:
-    st.metric("Nivel de riesgo", risk_level)
-with col2:
-    st.metric("Puntaje", risk_score)
+st.subheader("📊 Evaluación de riesgo")
+c1, c2 = st.columns(2)
+with c1: st.metric("Nivel de riesgo", risk_level)
+with c2: st.metric("Puntaje", risk_score)
 
-st.markdown("## 📌 Conclusiones")
+st.subheader("📌 Conclusiones")
 conclusions = []
 conclusions.append("• Se detectó un UID duplicado (posible cuenta compartida)." if dup_map else "• No se detectaron UIDs duplicados.")
 conclusions.append("• Existen intentos de acceso fallido." if not fails_df.empty else "• No se detectaron intentos de acceso fallido.")
 conclusions.append("• " + mfa_label)
 st.write("\n".join(conclusions))
 
-# ---------------------------
-# Exportar PDF
-# ---------------------------
+# ========== Exportar PDF ==========
 def build_pdf() -> bytes:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -246,8 +228,7 @@ def build_pdf() -> bytes:
     )
 
     # Usuarios (muestra)
-    pdf.set_font("Arial", "B", 12)
-    pdf.ln(2)
+    pdf.set_font("Arial", "B", 12); pdf.ln(2)
     pdf.cell(0, 8, "Usuarios (muestra):", ln=True)
     pdf.set_font("Arial", "", 11)
     for _, r in users_df.head(20).iterrows():
@@ -272,22 +253,18 @@ def build_pdf() -> bytes:
             dt = r["datetime"].strftime("%Y-%m-%d %H:%M:%S") if pd.notna(r["datetime"]) else "s/f"
             pdf.cell(0, 6, f"- {dt} | user {r['user']} | ip {r['ip']}", ln=True)
 
-    # Gráfico (si existe)
-    img_tmp = None
-    if 'fig' in globals() and plt.get_fignums():
-        # Guarda el último grafico mostrado
-        img_tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        plt.savefig(img_tmp.name, bbox_inches="tight")
+    # Gráfico si existe
+    if plt.get_fignums():
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        plt.savefig(tmp.name, bbox_inches="tight")
         pdf.add_page()
         pdf.set_font("Arial", "B", 12)
         pdf.cell(0, 8, "Grafico: Intentos fallidos por dia", ln=True)
-        pdf.image(img_tmp.name, w=180)
+        pdf.image(tmp.name, w=180)
 
-    # Salida como bytes
-    pdf_bytes = pdf.output(dest="S").encode("latin-1")
-    return pdf_bytes
+    return pdf.output(dest="S").encode("latin-1")
 
-st.markdown("## 🧾 Exportar informe")
+st.subheader("🧾 Exportar informe")
 if st.button("Generar PDF"):
     try:
         pdf_bytes = build_pdf()
